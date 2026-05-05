@@ -1,194 +1,153 @@
 /** @param {NS} ns **/
-/*
-  ServerAllocator.js
-  - Scans reachable servers and assigns them to batch or prep pools.
-  - Compatible with Bitburner 3.0.0 APIs.
-  - Self-contained: reads/writes usage and host lists under /data/.
-*/
-
+/**
+ * serverAllocator.js
+ *
+ * Scans purchased servers and home, computes usable RAM, and allocates threads
+ * for minimal worker scripts (scripts/hack.js, scripts/grow.js, scripts/weaken.js).
+ *
+ * Usage:
+ *   run serverAllocator.js [--dry] [--exec] [--reservedPerHost=2] [--reservedHomeRam=2] [--ratio=1,2,2]
+ *
+ * Notes:
+ * - Worker scripts are expected at home under scripts/<name>.
+ * - --dry prints allocation plan; --exec will attempt to scp and exec on each host.
+ */
 export async function main(ns) {
-  const ramThreshold = Number(ns.args[0]) || 32;
-  const batchFile = "/data/batchHosts.txt";
-  const prepFile = "/data/prepHosts.txt";
-  const usageFile = "/data/batchUsage.txt";
-  const prepTargetFile = "/data/prepTargets.txt";
+  ns.disableLog("sleep");
+  ns.disableLog("scp");
+  ns.disableLog("getServerMaxRam");
+  ns.disableLog("getServerUsedRam");
 
-  const EXCLUDED_BATCH = ["home", "worker0", "worker1"];
-  const ALWAYS_PREP = new Set(EXCLUDED_BATCH);
-  const USAGE_TIMEOUT = 30_000;
-  const RESERVED_EXPIRY = 300_000;
-  const REFRESH_MS = 10_000;
+  const flags = parseFlags(ns.args);
+  const dry = flags.dry === true || flags.dry === "true";
+  const execMode = flags.exec === true || flags.exec === "true";
+  const reservedPerHost = Number(flags.reservedPerHost) || 2;
+  const reservedHomeRam = Number(flags.reservedHomeRam) || 2;
+  const ratioArg = flags.ratio || "1,2,2";
+  const ratioParts = ratioArg.split(",").map(s => Number(s.trim()) || 0);
+  const ratio = { hack: ratioParts[0] || 1, grow: ratioParts[1] || 2, weaken: ratioParts[2] || 2 };
 
-  ns.disableLog("ALL");
-  ns.ui.openTail();
-  ns.print(`🧠 Allocator active | RAM threshold: ${ramThreshold}GB | refresh: ${REFRESH_MS / 1000}s`);
+  const hackScript = "scripts/hack.js";
+  const growScript = "scripts/grow.js";
+  const weakenScript = "scripts/weaken.js";
 
-  let firstCycle = true;
-
-  while (true) {
-    ns.clearLog();
-
-    // Initialize output files (overwrite each cycle)
-    await ns.write(batchFile, "", "w");
-    await ns.write(prepFile, "", "w");
-
-    const now = Date.now();
-
-    // Gather all reachable servers (including purchased)
-    const all = getAllServers(ns)
-      .filter(s => ns.serverExists(s) && ns.hasRootAccess(s) && ns.getServerMaxRam(s) > 0);
-
-    ns.print(`🧠 allocator cycle @ ${new Date().toLocaleTimeString()} | threshold=${ramThreshold} | hostsSeen=${all.length}`);
-    for (const s of all) {
-      ns.print(`🔍 ${s} | RAM: ${ns.getServerMaxRam(s)}GB`);
+  // Validate worker scripts exist on home
+  for (const f of [hackScript, growScript, weakenScript]) {
+    if (!ns.fileExists(f, "home")) {
+      ns.tprint(`serverAllocator: missing worker script on home: ${f}. Place workers in home/scripts and retry.`);
+      return;
     }
-
-    // Load usage map (host -> { ts, reserved })
-    let usageMap = {};
-    if (!firstCycle && ns.fileExists(usageFile)) {
-      try {
-        const raw = ns.read(usageFile);
-        if (raw && raw.trim().length) {
-          const lines = raw.split("\n").map(l => l.trim()).filter(Boolean);
-          for (const line of lines) {
-            const parts = line.split(",").map(p => p.trim());
-            const host = parts[0];
-            const ts = Number(parts[1]) || 0;
-            const reserved = parts[2] === "reserved";
-            if (host) usageMap[host] = { ts, reserved };
-          }
-        }
-      } catch (e) {
-        ns.print(`⚠️ Failed to read/parse usage file: ${String(e)}`);
-      }
-    }
-
-    // Clean up expired reservations and prepare updated usage lines
-    const updatedUsageEntries = [];
-    for (const [host, data] of Object.entries(usageMap)) {
-      const age = now - (data.ts || 0);
-      if (data.reserved && age > RESERVED_EXPIRY) {
-        ns.print(`♻️ Reservation expired for ${host} (age: ${Math.floor(age / 1000)}s)`);
-        data.reserved = false;
-      }
-      updatedUsageEntries.push(`${host},${data.ts}${data.reserved ? ",reserved" : ""}`);
-    }
-    // Persist usage (even if empty)
-    await ns.write(usageFile, updatedUsageEntries.join("\n") + (updatedUsageEntries.length ? "\n" : ""), "w");
-
-    // Step 1: Assign batch hosts (prioritize by free RAM)
-    const batchHosts = all
-      .filter(s => {
-        const maxRam = ns.getServerMaxRam(s);
-        const usedRam = ns.getServerUsedRam(s);
-        const freeRam = Math.max(0, maxRam - usedRam);
-        const isExcluded = EXCLUDED_BATCH.includes(s);
-        const isReserved = usageMap[s]?.reserved;
-
-        // If reserved and currently idle (usedRam === 0) we avoid assigning it to batch
-        if (isReserved && usedRam === 0) return false;
-        // If reserved but has some free RAM, allow it (helps utilize partially reserved hosts)
-        if (isReserved && freeRam > 1) return true;
-
-        return maxRam >= ramThreshold && !isExcluded;
-      })
-      .sort((a, b) => {
-        const freeA = ns.getServerMaxRam(a) - ns.getServerUsedRam(a);
-        const freeB = ns.getServerMaxRam(b) - ns.getServerUsedRam(b);
-        return freeB - freeA;
-      });
-
-    const batchSet = new Set(batchHosts);
-
-    // Step 2: Check for prep demand (prepTargets file non-empty)
-    let prepNeeded = false;
-    if (ns.fileExists(prepTargetFile)) {
-      try {
-        const rawPrep = ns.read(prepTargetFile);
-        prepNeeded = rawPrep && rawPrep.trim().length > 0;
-      } catch (e) {
-        ns.print(`⚠️ Could not read prep target file: ${String(e)}`);
-      }
-    }
-
-    // Step 3: Assign prep hosts (only if demand exists and not in batch)
-    let prepHosts = [];
-    if (prepNeeded) {
-      prepHosts = all.filter(s => {
-        const ram = ns.getServerMaxRam(s);
-        if (ram < 2) return false;
-
-        const isAlwaysAllowed = ALWAYS_PREP.has(s);
-        const isAlreadyBatch = batchSet.has(s);
-        const isReserved = usageMap[s]?.reserved;
-
-        if (isReserved && isAlreadyBatch) return false;
-        if (isAlreadyBatch) return false;
-
-        if (firstCycle) {
-          return isAlwaysAllowed || !isAlreadyBatch;
-        }
-
-        const lastUsed = usageMap[s]?.ts || 0;
-        const idleLongEnough = now - lastUsed > USAGE_TIMEOUT;
-        return isAlwaysAllowed || idleLongEnough;
-      });
-    } else {
-      ns.print("🛑 No prep targets found — skipping prep host assignment.");
-    }
-
-    // Persist assignments (use newline-separated lists)
-    await ns.write(batchFile, batchHosts.join("\n") + (batchHosts.length ? "\n" : ""), "w");
-    await ns.write(prepFile, prepHosts.join("\n") + (prepHosts.length ? "\n" : ""), "w");
-
-    ns.print(`💰 Batch Hosts (${batchHosts.length}):`);
-    for (const h of batchHosts) {
-      const max = ns.getServerMaxRam(h);
-      const used = ns.getServerUsedRam(h);
-      const free = Math.max(0, max - used);
-      ns.print(`  - ${h} (${max}GB | free: ${free.toFixed(1)}GB)`);
-    }
-
-    ns.print(`🛠️ Prep Hosts (${prepHosts.length}):`);
-    for (const h of prepHosts) {
-      const lastUsed = usageMap[h]?.ts || 0;
-      const idle = ((Date.now() - lastUsed) / 1000).toFixed(1);
-      ns.print(`  - ${h} (${ns.getServerMaxRam(h)}GB)${firstCycle ? "" : ` | idle: ${idle}s`}`);
-    }
-
-    firstCycle = false;
-    await ns.sleep(REFRESH_MS);
   }
+
+  // Build host list: home + purchased servers
+  let hosts = ["home"];
+  try {
+    const purchased = ns.getPurchasedServers();
+    if (purchased && purchased.length) hosts = hosts.concat(purchased);
+  } catch (e) {
+    ns.tprint(`serverAllocator: error retrieving purchased servers: ${e}`);
+  }
+
+  // Compute usable RAM and script RAM per host
+  const hostInfo = [];
+  for (const h of hosts) {
+    try {
+      const maxRam = ns.getServerMaxRam(h);
+      const usedRam = ns.getServerUsedRam(h);
+      const reserved = (h === "home") ? reservedHomeRam : reservedPerHost;
+      const usable = Math.max(0, maxRam - usedRam - reserved);
+      const ramHack = ns.getScriptRam(hackScript, "home");
+      const ramGrow = ns.getScriptRam(growScript, "home");
+      const ramWeaken = ns.getScriptRam(weakenScript, "home");
+      hostInfo.push({ host: h, maxRam, usedRam, reserved, usable, ramHack, ramGrow, ramWeaken });
+    } catch (e) {
+      ns.print(`serverAllocator: error querying ${h}: ${e}`);
+    }
+  }
+
+  // Sort hosts by usable RAM descending
+  hostInfo.sort((a, b) => b.usable - a.usable);
+
+  // Build allocation plan
+  const plan = [];
+  for (const h of hostInfo) {
+    const perBatchRam = ratio.hack * h.ramHack + ratio.grow * h.ramGrow + ratio.weaken * h.ramWeaken;
+    if (perBatchRam <= 0 || h.usable < Math.min(h.ramHack, h.ramGrow, h.ramWeaken)) {
+      plan.push({ host: h.host, usable: h.usable, hack: 0, grow: 0, weaken: 0 });
+      continue;
+    }
+    // Fit as many batches as possible
+    const batches = Math.max(1, Math.floor(h.usable / perBatchRam));
+    const hackThreads = Math.max(0, Math.floor(ratio.hack * batches));
+    const growThreads = Math.max(0, Math.floor(ratio.grow * batches));
+    const weakenThreads = Math.max(0, Math.floor(ratio.weaken * batches));
+    plan.push({ host: h.host, usable: h.usable, hack: hackThreads, grow: growThreads, weaken: weakenThreads, totalRam: hackThreads*h.ramHack + growThreads*h.ramGrow + weakenThreads*h.ramWeaken });
+  }
+
+  // Print plan summary
+  ns.tprint("serverAllocator: allocation plan:");
+  for (const p of plan) {
+    ns.print(`  ${p.host}: usable=${p.usable} -> hack=${p.hack} grow=${p.grow} weaken=${p.weaken} ram=${p.totalRam ?? 0}`);
+  }
+
+  if (dry || !execMode) {
+    ns.tprint("serverAllocator: dry mode or exec not enabled; not executing scripts.");
+    return;
+  }
+
+  // Exec mode: scp workers to hosts and launch scripts
+  for (const p of plan) {
+    if (p.host === "home") {
+      ns.print("serverAllocator: skipping exec on home (workers run from home by bootstrap/batchEngine).");
+      continue;
+    }
+    // Ensure scripts present on host
+    for (const src of [hackScript, growScript, weakenScript]) {
+      try {
+        const ok = ns.scp(src, p.host, "home");
+        if (!ok) ns.print(`serverAllocator: scp failed for ${src} -> ${p.host}`);
+      } catch (e) {
+        ns.print(`serverAllocator: scp exception for ${src} -> ${p.host}: ${e}`);
+      }
+      await ns.sleep(50);
+    }
+
+    // Launch weaken -> grow -> hack with small offsets
+    try {
+      if (p.weaken > 0) {
+        const pidW = ns.exec(weakenScript, p.host, p.weaken, p.host === "home" ? p.host : p.host); // target arg is the target host; orchestrator may override
+        if (!pidW) ns.print(`serverAllocator: failed to exec weaken on ${p.host}`);
+      }
+      await ns.sleep(200);
+      if (p.grow > 0) {
+        const pidG = ns.exec(growScript, p.host, p.grow, p.host);
+        if (!pidG) ns.print(`serverAllocator: failed to exec grow on ${p.host}`);
+      }
+      await ns.sleep(200);
+      if (p.hack > 0) {
+        const pidH = ns.exec(hackScript, p.host, p.hack, p.host);
+        if (!pidH) ns.print(`serverAllocator: failed to exec hack on ${p.host}`);
+      }
+      ns.tprint(`serverAllocator: launched workers on ${p.host} (hack:${p.hack} grow:${p.grow} weaken:${p.weaken})`);
+    } catch (e) {
+      ns.print(`serverAllocator: error launching on ${p.host}: ${e}`);
+    }
+    await ns.sleep(200);
+  }
+
+  ns.tprint("serverAllocator: finished.");
 }
 
-/* ---------- Helpers ---------- */
+/* -------------------- Helpers -------------------- */
 
-function getAllServers(ns) {
-  const seen = new Set();
-  const out = [];
-  const stack = ["home"];
-
-  while (stack.length) {
-    const cur = String(stack.pop()).trim();
-    if (!cur || seen.has(cur)) continue;
-    seen.add(cur);
-    out.push(cur);
-    try {
-      for (const n of ns.scan(cur)) stack.push(n);
-    } catch {
-      // ignore scan errors for special nodes
-    }
+function parseFlags(args) {
+  const out = {};
+  for (const a of args) {
+    if (typeof a !== "string") continue;
+    if (!a.startsWith("--")) continue;
+    const eq = a.indexOf("=");
+    if (eq === -1) out[a.slice(2)] = true;
+    else out[a.slice(2, eq)] = a.slice(eq + 1);
   }
-
-  // Include purchased servers (cloud API)
-  try {
-    const purchased = (typeof ns.cloud?.getServerNames === "function")
-      ? ns.cloud.getServerNames()
-      : (typeof ns.getPurchasedServers === "function" ? ns.getPurchasedServers() : []);
-    for (const p of purchased) if (!seen.has(p)) { seen.add(p); out.push(p); }
-  } catch {
-    // ignore if API not present
-  }
-
   return out;
 }
