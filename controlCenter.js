@@ -1,171 +1,119 @@
 /** @param {NS} ns **/
-/*
-  controlCenter.js
-  - Starts and monitors a set of manager/engine scripts.
-  - Auto-restarts any that stop.
-  - Opens tails for selected scripts.
-  - Updated for Bitburner 3.0.0 API behavior and defensive checks.
-  - NOTE: This script assumes it runs on a machine with enough RAM to run the control center itself.
-*/
-
+/**
+ * controlCenter.js
+ *
+ * Lightweight supervisor for early-run automation.
+ *
+ * Usage:
+ *   run controlCenter.js [--dry] [--monitorInterval=10000] [--autoBootstrap=true]
+ *
+ * Notes:
+ * - Worker scripts expected under home/scripts.
+ * - Does not use Singularity APIs.
+ */
 export async function main(ns) {
-  ns.disableLog("ALL");
-  ns.clearLog();
-  ns.ui.openTail();
+  ns.disableLog("sleep");
+  ns.disableLog("getServerMaxRam");
+  ns.disableLog("getServerUsedRam");
 
-  const MAX_BATCH_TARGETS = 4;
-  const CHECK_INTERVAL = 10_000; // ms
+  const flags = parseFlags(ns.args);
+  const dry = flags.dry === true || flags.dry === "true";
+  const monitorInterval = Number(flags.monitorInterval) || 10000;
+  const autoBootstrap = flags.autoBootstrap === "false" ? false : true;
 
-  // Script list: name, args, human tag, whether to tail, startup delay in seconds
-  const scripts = [
-    { name: "rebalancer.js", args: [MAX_BATCH_TARGETS], tag: "🧠 Rebalancer", tail: true,  delay: 0 },
-    { name: "targetManager.js", args: [],           tag: "🎯 Target Manager", tail: true,  delay: 0 },
-    { name: "prepEngine.js",    args: [],           tag: "🛠️ PrepEngine",     tail: false, delay: 60 },
-    { name: "batchEngine.js",   args: [],           tag: "💰 BatchEngine",    tail: false, delay: 30 },
-    { name: "profitTracker.js", args: [],           tag: "💰 ProfitTracker",  tail: true,  delay: 0 },
-    { name: "autoroot.js",      args: [],           tag: "🕷️ Autoroot",       tail: false, delay: 0 }
-  ];
+  ns.tprint(`controlCenter: starting (dry=${dry}) interval=${monitorInterval} autoBootstrap=${autoBootstrap}`);
 
-  ns.print("🚀 Control Center initialized.\n");
+  // Scripts this supervisor may start (if present)
+  const bootstrapScript = "bootstrap.js";
+  const prepScript = "prepEngine.js";
 
-  // Map script name -> pid
-  const pids = {};
-  // Track which scripts we've opened a tail for
-  const tailed = new Set();
+  // Simple uptime guard: only auto-bootstrap during first hour after run start
+  const startTs = Date.now();
+  const autoBootstrapWindowMs = 60 * 60 * 1000; // 1 hour
 
-  // Helper: scan all reachable servers
-  function scanAllHosts() {
-    const seen = new Set();
-    const stack = ["home"];
-    while (stack.length) {
-      const cur = String(stack.pop()).trim();
-      if (!cur || seen.has(cur)) continue;
-      seen.add(cur);
-      try {
-        const neighbors = ns.scan(cur);
-        for (const n of neighbors) {
-          if (!seen.has(n)) stack.push(n);
-        }
-      } catch {
-        // ignore
-      }
-    }
-    return Array.from(seen);
-  }
-
-  // Helper: find a running process by filename across all hosts
-  function findProcessByName(filename) {
-    try {
-      const hosts = scanAllHosts();
-      for (const host of hosts) {
-        try {
-          const procs = ns.ps(host) || [];
-          for (const p of procs) {
-            if (p.filename === filename) return { pid: p.pid, host };
-          }
-        } catch {
-          // ignore ps errors for this host
-        }
-      }
-    } catch {
-      // ignore
-    }
-    return null;
-  }
-
-  // Initial launch with per-script delay support
-  for (const { name, args, tag, tail, delay = 0 } of scripts) {
-    try {
-      if (delay && delay > 0) await ns.sleep(delay * 1000);
-
-      // Try to find an existing running instance anywhere
-      const running = findProcessByName(name);
-      if (running) {
-        pids[name] = running.pid;
-        ns.print(`${tag} already running (PID: ${running.pid} on ${running.host})`);
-        if (tail && !tailed.has(name)) {
-          try {
-            ns.ui.openTail(running.pid);
-            tailed.add(name);
-          } catch {
-            // ignore tail errors
-          }
-        }
-        continue;
-      }
-
-      // Not running: attempt to start on home
-      const pid = ns.run(name, 1, ...args);
-      if (pid && pid > 0) {
-        pids[name] = pid;
-        ns.print(`${tag} started (PID: ${pid})`);
-        if (tail && !tailed.has(name)) {
-          try {
-            ns.ui.openTail(pid);
-            tailed.add(name);
-          } catch {
-            // ignore tail errors
-          }
-        }
-      } else {
-        ns.print(`❌ Failed to start ${tag} (insufficient RAM or missing file)`);
-      }
-    } catch (e) {
-      ns.print(`❌ Error while launching ${name}: ${String(e)}`);
-    }
-  }
-
-  // Auto-restart / monitor loop
   while (true) {
     try {
-      for (const { name, args, tag, tail } of scripts) {
-        try {
-          // First, check if there's any running instance anywhere
-          const running = findProcessByName(name);
+      // Basic status snapshot
+      const homeMax = ns.getServerMaxRam("home");
+      const homeUsed = ns.getServerUsedRam("home");
+      const purchased = ns.getPurchasedServers();
+      const purchasedCount = purchased ? purchased.length : 0;
+      const money = ns.getServerMoneyAvailable("home");
 
-          if (running) {
-            // If we didn't know about it or PID changed, update and tail if requested
-            if (!pids[name] || pids[name] !== running.pid) {
-              pids[name] = running.pid;
-              ns.print(`${tag} detected running (PID: ${running.pid} on ${running.host})`);
-              if (tail && !tailed.has(name)) {
-                try {
-                  ns.ui.openTail(running.pid);
-                  tailed.add(name);
-                } catch {
-                  // ignore
-                }
-              }
-            }
-            // If it's running, nothing to do
-            continue;
-          }
+      ns.print(`controlCenter: home RAM ${homeUsed}/${homeMax} | purchased ${purchasedCount} | money ${formatMoney(money)}`);
 
-          // No running instance found: attempt restart
-          ns.print(`🔄 ${tag} not running — attempting restart...`);
-          const newPid = ns.run(name, 1, ...args);
-          if (newPid && newPid > 0) {
-            pids[name] = newPid;
-            ns.print(`${tag} restarted (PID: ${newPid})`);
-            if (tail && !tailed.has(name)) {
-              try {
-                ns.ui.openTail(newPid);
-                tailed.add(name);
-              } catch {
-                // ignore
-              }
+      // Check for key scripts and optionally start them if missing
+      if (autoBootstrap && (Date.now() - startTs) < autoBootstrapWindowMs) {
+        // If bootstrap.js exists on home and is not running, start it (unless dry)
+        if (ns.fileExists(bootstrapScript, "home")) {
+          const running = ns.ps("home").some(p => p.filename === bootstrapScript);
+          if (!running) {
+            ns.print("controlCenter: bootstrap.js not running");
+            if (!dry) {
+              const pid = ns.exec(bootstrapScript, "home", 1);
+              if (pid) ns.tprint(`controlCenter: started ${bootstrapScript} pid=${pid}`);
+              else ns.tprint(`controlCenter: failed to start ${bootstrapScript}`);
+            } else {
+              ns.tprint("controlCenter: dry mode - would start bootstrap.js");
             }
-          } else {
-            ns.print(`❌ Failed to restart ${tag} (insufficient RAM or missing file)`);
           }
-        } catch (innerErr) {
-          ns.print(`⚠️ Error monitoring ${name}: ${String(innerErr)}`);
+        }
+
+        // Similarly ensure prepEngine is running if present
+        if (ns.fileExists(prepScript, "home")) {
+          const runningPrep = ns.ps("home").some(p => p.filename === prepScript);
+          if (!runningPrep) {
+            ns.print("controlCenter: prepEngine.js not running");
+            if (!dry) {
+              const pid = ns.exec(prepScript, "home", 1);
+              if (pid) ns.tprint(`controlCenter: started ${prepScript} pid=${pid}`);
+              else ns.tprint(`controlCenter: failed to start ${prepScript}`);
+            } else {
+              ns.tprint("controlCenter: dry mode - would start prepEngine.js");
+            }
+          }
         }
       }
+
+      // Print a short summary of purchased servers and their usable RAM
+      if (purchased && purchased.length) {
+        for (const h of purchased) {
+          try {
+            const max = ns.getServerMaxRam(h);
+            const used = ns.getServerUsedRam(h);
+            ns.print(`  pserv ${h}: ${used}/${max} RAM used`);
+          } catch (e) {
+            ns.print(`  pserv ${h}: error querying RAM: ${e}`);
+          }
+        }
+      }
+
     } catch (e) {
-      ns.print(`⚠️ Control loop error: ${String(e)}`);
+      ns.print(`controlCenter: unexpected error: ${e}`);
     }
 
-    await ns.sleep(CHECK_INTERVAL);
+    await ns.sleep(monitorInterval);
+  }
+
+  // helpers (never reached)
+  function parseFlags(args) {
+    const out = {};
+    for (const a of args) {
+      if (typeof a !== "string") continue;
+      if (!a.startsWith("--")) continue;
+      const eq = a.indexOf("=");
+      if (eq === -1) out[a.slice(2)] = true;
+      else out[a.slice(2, eq)] = a.slice(eq + 1);
+    }
+    return out;
+  }
+
+  function formatMoney(n) {
+    if (n === undefined || n === null) return String(n);
+    if (n >= 1e12) return `${(n / 1e12).toFixed(2)}T`;
+    if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+    if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(2)}k`;
+    return `${n}`;
   }
 }
