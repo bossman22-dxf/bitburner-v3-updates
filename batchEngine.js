@@ -3,15 +3,15 @@
  * batchEngine.js
  *
  * Purpose: schedule simple hack/grow/weaken batches against a target.
- * - Conservative defaults; use config or args to tune.
+ * - Conservative defaults; use flags to tune.
  * - Dry run mode prints planned actions without executing.
  * - Uses lock files on home to avoid overlapping batches from multiple controllers.
  *
  * Usage:
- *   run batchEngine.js <target> [--dry] [--threadsPerBatch=...]
+ *   run batchEngine.js <target> [--dry] [--threadsPerBatch=...] [--reservedHomeRam=...]
  *
  * Notes:
- * - This script assumes the helper scripts (hack.js, grow.js, weaken.js) exist on home.
+ * - This script assumes the worker scripts (hack.js, grow.js, weaken.js) exist on home.
  * - It does not rely on Singularity APIs.
  */
 export async function main(ns) {
@@ -19,8 +19,7 @@ export async function main(ns) {
   ns.disableLog("getServerMaxRam");
   ns.disableLog("getServerUsedRam");
 
-  const args = ns.args.slice();
-  const target = (args[0] && typeof args[0] === "string") ? args[0] : ns.args[0] ?? "n00dles";
+  const target = ns.args[0] ?? "n00dles";
 
   // Parse flags from args (simple)
   const flags = parseFlags(ns.args);
@@ -31,9 +30,11 @@ export async function main(ns) {
 
   ns.tprint(`batchEngine: target=${target} dryRun=${dryRun} threadsPerBatch=${threadsPerBatch || "auto"} batchGapMs=${batchGapMs}`);
 
-  // Basic validation
-  if (!ns.serverExists(target)) {
-    ns.tprint(`batchEngine: target ${target} does not exist`);
+  // Basic validation (robust check)
+  try {
+    ns.getServer(target);
+  } catch (e) {
+    ns.tprint(`batchEngine: target ${target} does not exist or cannot be queried: ${e}`);
     return;
   }
 
@@ -68,7 +69,7 @@ export async function main(ns) {
     // Available RAM on home (conservative)
     const homeMax = ns.getServerMaxRam("home");
     const homeUsed = ns.getServerUsedRam("home");
-    const reservedHome = Number(flags.reservedHomeRam) || 8; // keep some RAM free
+    const reservedHome = Number(flags.reservedHomeRam) || 2; // small buffer by default; set to 0 to fully pack
     const usableHomeRam = Math.max(0, homeMax - homeUsed - reservedHome);
 
     // If threadsPerBatch provided, use it to compute per-script threads proportionally
@@ -82,8 +83,6 @@ export async function main(ns) {
       planned.weakenThreads = Math.max(1, Math.floor((threadsPerBatch * ratio.weaken) / totalRatio));
     } else {
       // Auto-calc: fit as many full batches as possible on home using script RAM
-      // We'll compute a single batch sized to use up to usableHomeRam (conservative)
-      // Use ratio hack:grow:weaken = 1:2:2 (common safe starting point)
       const ratio = { hack: 1, grow: 2, weaken: 2 };
       const perBatchRam = ratio.hack * scriptRamHack + ratio.grow * scriptRamGrow + ratio.weaken * scriptRamWeaken;
       if (perBatchRam <= 0) {
@@ -91,17 +90,10 @@ export async function main(ns) {
         return;
       }
       const maxBatches = Math.max(1, Math.floor(usableHomeRam / perBatchRam));
-      // We'll run one batch at a time by default; compute threads for a single batch
-      planned.hackThreads = Math.max(1, Math.floor((ratio.hack * 1)));
-      planned.growThreads = Math.max(1, Math.floor((ratio.grow * 1)));
-      planned.weakenThreads = Math.max(1, Math.floor((ratio.weaken * 1)));
-      // If usableHomeRam allows more aggressive threads, scale up proportionally
-      const scale = Math.floor(usableHomeRam / perBatchRam);
-      if (scale > 1) {
-        planned.hackThreads *= scale;
-        planned.growThreads *= scale;
-        planned.weakenThreads *= scale;
-      }
+      // Compute threads for a single batch, then scale by available batches
+      planned.hackThreads = Math.max(1, Math.floor(ratio.hack * maxBatches));
+      planned.growThreads = Math.max(1, Math.floor(ratio.grow * maxBatches));
+      planned.weakenThreads = Math.max(1, Math.floor(ratio.weaken * maxBatches));
     }
 
     // Final safety: ensure planned threads fit in usableHomeRam
@@ -128,17 +120,15 @@ export async function main(ns) {
     }
 
     // Schedule a single batch with conservative offsets so weaken finishes last
-    // Offsets chosen so: weaken finishes slightly after grow and hack
     const now = Date.now();
     const weakenFinish = now + weakenTime;
     const hackOffset = Math.max(0, weakenTime - hackTime - 150);   // hack should finish ~150ms before weaken
     const growOffset = Math.max(0, weakenTime - growTime - 300);   // grow should finish ~300ms before weaken
-    const weakenOffset = Math.max(0, 0); // start weaken immediately so it finishes at weakenFinish
 
     // Launch weaken (first instance)
     const home = "home";
     const weakenPid = await safeExec(ns, scripts.weaken, home, planned.weakenThreads, [target]);
-    ns.print(`batchEngine: launched weaken pid=${weakenPid} threads=${planned.weakenThreads} offset=${weakenOffset}`);
+    ns.print(`batchEngine: launched weaken pid=${weakenPid} threads=${planned.weakenThreads} offset=0`);
 
     // Sleep until time to launch grow
     await ns.sleep(Math.max(0, growOffset));
