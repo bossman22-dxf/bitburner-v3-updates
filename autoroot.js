@@ -68,17 +68,17 @@ export async function main(ns) {
     }
 
     if (targets.length === 0) {
-      ns.tprint("autoroot: no candidate targets found.");
+      ns.print("autoroot: no candidate targets found.");
       return;
     }
 
-    ns.tprint(`autoroot: candidates: ${targets.join(", ")}`);
+    ns.print(`autoroot: candidates: ${targets.join(", ")}`);
 
     for (const target of targets) {
       ns.print(`autoroot: processing ${target}`);
 
       // Skip home and purchased servers
-      if (target === "home" || ns.getPurchasedServers().includes(target)) {
+      if (target === "home" || ns.cloud.getServerNames().includes(target)) {
         ns.print(`autoroot: skipping ${target} (home or purchased)`);
         continue;
       }
@@ -111,7 +111,7 @@ export async function main(ns) {
           ns.tprint(`autoroot: nuked ${target}`);
           if (deploy && !dry) await deployWorkersTo(ns, target, workerFiles);
         } else {
-          ns.tprint(`autoroot: not enough ports opened for ${target} (opened ${opened}, required ${required})`);
+          ns.print(`autoroot: not enough ports opened for ${target} (opened ${opened}, required ${required})`);
         }
       } catch (e) {
         ns.tprint(`autoroot: error checking/nuking ${target}: ${e}`);
@@ -124,7 +124,7 @@ export async function main(ns) {
     removeLock(ns, lockFile);
   }
 
-  ns.tprint("autoroot: finished.");
+  ns.print("autoroot: finished.");
 }
 
 /* -------------------- Helpers -------------------- */
@@ -145,7 +145,7 @@ function discoverServers(ns, availableOpeners, maxTargets) {
   const visited = new Set(["home"]);
   const queue = ["home"];
   const candidates = [];
-  const purchased = ns.getPurchasedServers();
+  const purchased = ns.cloud.getServerNames();
   while (queue.length && candidates.length < maxTargets) {
     const node = queue.shift();
     for (const n of ns.scan(node)) {
@@ -156,8 +156,6 @@ function discoverServers(ns, availableOpeners, maxTargets) {
         if (n === "home" || purchased.includes(n)) continue;
         const srv = ns.getServer(n);
         if (!srv) continue;
-        // skip servers with no money or special servers
-        if (srv.moneyMax <= 0) continue;
         // prefer servers we can nuke (enough openers)
         const required = ns.getServerNumPortsRequired(n);
         if (availableOpeners.length >= required) {
