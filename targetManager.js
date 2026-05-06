@@ -47,8 +47,8 @@ export async function main(ns) {
             const icon = ready ? "✅" : "⏳";
             ns.print(
                 `  - ${t} ${icon} | ` +
-                `💵 Max: ${ns.format.number(ns.getServerMaxMoney(t), "$0.000a")} | ` +
-                `💰 Now: ${ns.format.number(ns.getServerMoneyAvailable(t), "$0.000a")} | ` +
+                `💵 Max: ${formatShort(ns.getServerMaxMoney(t))} | ` +
+                `💰 Now: ${formatShort(ns.getServerMoneyAvailable(t))} | ` +
                 `🔐 Sec: ${ns.getServerSecurityLevel(t).toFixed(2)} / ${ns.getServerMinSecurityLevel(t)}`
             );
         }
@@ -59,8 +59,8 @@ export async function main(ns) {
             const icon = ready ? "✅" : "⏳";
             ns.print(
                 `  - ${t} ${icon} | ` +
-                `💵 Max: ${ns.format.number(ns.getServerMaxMoney(t), "$0.000a")} | ` +
-                `💰 Now: ${ns.format.number(ns.getServerMoneyAvailable(t), "$0.000a")} | ` +
+                `💵 Max: ${formatShort(ns.getServerMaxMoney(t))} | ` +
+                `💰 Now: ${formatShort(ns.getServerMoneyAvailable(t))} | ` +
                 `🔐 Sec: ${ns.getServerSecurityLevel(t).toFixed(2)} / ${ns.getServerMinSecurityLevel(t)}`
             );
         }
@@ -92,4 +92,14 @@ function isReady(ns, target) {
     const money = ns.getServerMoneyAvailable(target);
     const maxMoney = ns.getServerMaxMoney(target);
     return sec <= minSec + 0.5 && money >= maxMoney * 0.95;
+}
+function formatShort(n) {
+    if (n === 0) return "0";
+    const abs = Math.abs(n);
+    if (abs < 1e3) return n.toString();
+    if (abs < 1e6) return (n / 1e3).toFixed(2) + "k";
+    if (abs < 1e9) return (n / 1e6).toFixed(2) + "m";
+    if (abs < 1e12) return (n / 1e9).toFixed(2) + "b";
+    if (abs < 1e15) return (n / 1e12).toFixed(2) + "t";
+    return n.toExponential(2);
 }
